@@ -1,12 +1,13 @@
 import { createApp } from "./app.js";
+import { env } from "./config/env.js";
+import { logger } from "./infra/logger.js";
 
-const port = Number(process.env.PORT ?? 4000);
 const app = createApp();
 
-app.listen(port, (error?: Error) => {
+app.listen(env.PORT, (error?: Error) => {
   if (error) {
-    console.error("Failed to start API server", error);
+    logger.fatal({ err: error }, "Failed to start API server");
     process.exit(1);
   }
-  console.log(`API listening on http://localhost:${port}`);
+  logger.info({ port: env.PORT, nodeEnv: env.NODE_ENV }, `API listening on http://localhost:${env.PORT}`);
 });
