@@ -1,9 +1,13 @@
 import express, { type Express } from "express";
+import { errorHandler } from "./middleware/error-handler.js";
+import { notFoundHandler } from "./middleware/not-found.js";
+import { requestLogger } from "./middleware/request-logger.js";
 
 export function createApp(): Express {
   const app = express();
 
   app.disable("x-powered-by");
+  app.use(requestLogger);
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/api/health", (_req, res) => {
@@ -15,6 +19,9 @@ export function createApp(): Express {
       },
     });
   });
+
+  app.use(notFoundHandler);
+  app.use(errorHandler);
 
   return app;
 }
