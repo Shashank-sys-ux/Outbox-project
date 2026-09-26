@@ -3,7 +3,8 @@ import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { assertElasticsearchHealthy, elasticsearch } from "./infra/elasticsearch.js";
 import { logger } from "./infra/logger.js";
-import { redis } from "./infra/redis.js";
+import { closeRedisClient, redis } from "./infra/redis.js";
+import { closeHttpServer, registerGracefulShutdown } from "./infra/shutdown.js";
 import {
   createElasticsearchHealthCheck,
   createRedisHealthCheck,
@@ -48,6 +49,16 @@ async function main(): Promise<void> {
   });
 
   logger.info({ port: env.PORT, nodeEnv: env.NODE_ENV }, `API listening on http://localhost:${env.PORT}`);
+
+  registerGracefulShutdown({
+    logger,
+    timeoutMs: env.SHUTDOWN_TIMEOUT_MS,
+    tasks: [
+      { name: "http-server", run: () => closeHttpServer(server) },
+      { name: "redis", run: () => closeRedisClient(redis) },
+      { name: "elasticsearch", run: () => elasticsearch.close() },
+    ],
+  });
 }
 
 main().catch((error: unknown) => {
