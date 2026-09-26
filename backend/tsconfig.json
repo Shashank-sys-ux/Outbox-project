@@ -5,8 +5,7 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "types": ["node"],
-    "rootDir": "src",
-    "outDir": "dist",
+    "noEmit": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -18,5 +17,5 @@
     "skipLibCheck": true,
     "sourceMap": true
   },
-  "include": ["src"]
+  "include": ["src", "tests", "vitest.config.ts"]
 }
