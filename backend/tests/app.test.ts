@@ -105,3 +105,65 @@ describe("error responses", () => {
     expect(response.body.error.code).toBe("PAYLOAD_TOO_LARGE");
   });
 });
+
+describe("security middleware", () => {
+  it("rejects protected API calls without a session", async () => {
+    const app = appWith(true, true);
+
+    for (const path of ["/api/auth/me", "/api/emails", "/api/senders", "/api/campaigns", "/api/search/emails"]) {
+      const response = await request(app).get(path);
+      expect(response.status, path).toBe(401);
+      expect(response.body.error.code).toBe("UNAUTHENTICATED");
+    }
+  });
+
+  it("ignores a forged session cookie", async () => {
+    const response = await request(appWith(true, true))
+      .get("/api/auth/me")
+      .set("Cookie", `outbox_sid=${"x".repeat(43)}`);
+
+    expect(response.status).toBe(401);
+  });
+
+  it("blocks state changing requests from another origin", async () => {
+    const response = await request(appWith(true, true))
+      .post("/api/campaigns")
+      .set("Origin", "https://evil.example")
+      .send({});
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("keeps the queue dashboard behind login", async () => {
+    const response = await request(appWith(true, true)).get("/admin/queues");
+
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain("/login?returnTo=");
+  });
+
+  it("exposes public feature flags and limits", async () => {
+    const response = await request(appWith(true, true)).get("/api/config");
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toMatchObject({
+      googleAuth: false,
+      slack: false,
+      limits: { minSendDelayMs: 2000, maxEmailsPerHourPerSender: 200 },
+    });
+  });
+
+  it("sends security headers on API responses", async () => {
+    const response = await request(appWith(true, true)).get("/api/config");
+
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.headers["x-powered-by"]).toBeUndefined();
+  });
+
+  it("redirects to the login page with an error when Google is not configured", async () => {
+    const response = await request(appWith(true, true)).get("/api/auth/google");
+
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toBe("https://localhost:5173/login?error=google_not_configured");
+  });
+});

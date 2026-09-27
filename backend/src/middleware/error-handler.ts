@@ -1,4 +1,5 @@
 import type { ErrorRequestHandler } from "express";
+import multer from "multer";
 import { ZodError } from "zod";
 import type { ApiErrorBody } from "../types/api.js";
 import { AppError } from "../utils/errors.js";
@@ -25,6 +26,13 @@ export function toAppError(error: unknown): AppError {
         message: issue.message,
       })),
     });
+  }
+
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return new AppError(413, "PAYLOAD_TOO_LARGE", "The uploaded file is too large");
+    }
+    return new AppError(400, "BAD_REQUEST", `Upload rejected: ${error.message}`);
   }
 
   if (isHttpLikeError(error)) {

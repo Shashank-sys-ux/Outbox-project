@@ -3,6 +3,10 @@ import type { Redis } from "ioredis";
 import { assertElasticsearchHealthy } from "../../infra/elasticsearch.js";
 import type { HealthCheck } from "./health.service.js";
 
+export function createDatabaseHealthCheck(check: () => Promise<void>): HealthCheck {
+  return { name: "database", critical: true, check };
+}
+
 export function createRedisHealthCheck(client: Redis): HealthCheck {
   return {
     name: "redis",

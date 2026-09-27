@@ -3,6 +3,7 @@ dist/
 build/
 coverage/
 .vite/
+backend/src/generated/
 *.tsbuildinfo
 *.log
 npm-debug.log*
