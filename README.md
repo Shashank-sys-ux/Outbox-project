@@ -267,18 +267,7 @@ Redis runs with:
 - `--appendonly yes --appendfsync everysec`: delayed jobs survive a restart, with at most about 1 second of writes at risk.
 - `--maxmemory-policy noeviction`: Redis never silently deletes queue keys.
 
-Keys used by the app:
-
-| Key | Purpose |
-|---|---|
-| `bull:<queue>:*` | BullMQ |
-| `sess:<hmac(sessionId)>` | Sessions. The raw cookie value is never stored |
-| `oauth:<provider>:<state>` | One-time OAuth state, 10 minute TTL, read with `GETDEL` |
-| `rl:{s:<senderId>}:last_slot` | Last reserved send time for the sender (string, enforces the minimum gap) |
-| `rl:{s:<senderId>}:slots` | Sorted set of the sender's reserved sends: member = email ID, score = slot time in ms |
-| `rl:{s:<senderId>}:campaign:<campaignId>:slots` | Same sorted set, scoped to one campaign |
-| `rl:{s:<senderId>}:alerted:<scope>:<scopeId>` | Slack alert de-duplication (`SET NX`, expires after one window); scope is `sender` or `campaign` |
-| `api_rl:<name>:<identity>:<minute>` | API request throttling |
+Redis stores BullMQ jobs, sessions, send slots and rolling-window rate-limit state. Atomic Lua reservations make rate limiting safe across workers.
 
 ## 12. Elasticsearch setup
 
@@ -365,48 +354,22 @@ npm run dev
 
 Open https://localhost:5173 and accept the self-signed certificate once. Vite proxies `/api` and `/admin` to `http://localhost:4000`, so the browser only ever talks to one origin. There is no CORS setup and cookies just work.
 
-## 19. API documentation
+## 19. API overview
 
-**Conventions**
+All endpoints are under `/api` and, apart from health, config and the OAuth redirects, require the session cookie. Success responses are `{ "data": ... }`; errors are `{ "error": { "code", "message", "details?", "requestId" } }`.
 
-- Success responses are `{ "data": ... }`.
-- Errors are `{ "error": { "code", "message", "details?", "requestId" } }`.
-- Every response carries `x-request-id`.
-- Authenticated routes need the `outbox_sid` session cookie and return `401 UNAUTHENTICATED` without it.
-- State-changing requests from a foreign `Origin` get `403 FORBIDDEN`.
+Key endpoints:
 
-| Method | Path | Auth | Body or query | Response |
-|---|---|---|---|---|
-| GET | `/api/health` | none | | Liveness |
-| GET | `/api/health/ready` | none | | `{ status: ok \| degraded \| down, checks }`, 503 when down |
-| GET | `/api/config` | none | | Feature flags and limits |
-| GET | `/api/auth/google?returnTo=/path` | none | | 302 to Google |
-| GET | `/api/auth/google/callback` | none | `code`, `state` | Sets the session cookie, 302 to the app, or to `/login?error=` |
-| GET | `/api/auth/me` | session | | `{ id, email, name, avatarUrl, isAdmin }` |
-| POST | `/api/auth/logout` | session | | 204, session deleted |
-| GET | `/api/senders` | session | | Sender list (never includes passwords) |
-| POST | `/api/senders` | session | `{ displayName, email, smtpHost, smtpPort, smtpSecure, smtpUser, smtpPassword }` | 201; SMTP login is verified first |
-| POST | `/api/senders/ethereal` | session | `{ displayName? }` | 201, new Ethereal sender |
-| POST | `/api/senders/:id/test` | session | `{ to? }` | `{ messageId, previewUrl }` |
-| DELETE | `/api/senders/:id` | session | | 204, or 409 if campaigns use it |
-| POST | `/api/leads/parse` | session | multipart `file` (.csv/.txt) or JSON `{ text }` | `{ emails, stats: { candidates, valid, invalid, duplicates, truncated }, invalidSamples }` |
-| POST | `/api/campaigns` | session and `Idempotency-Key` header | `{ senderId, subject, body, recipients[], startAt, delayBetweenMs, hourlyLimit }` | 201 created; 200 with `Idempotent-Replayed: true` for a repeat; 409 if the key was used with a different body |
-| GET | `/api/campaigns?page&pageSize` | session | | Campaigns with per-status counts |
-| GET | `/api/campaigns/:id` | session | | One campaign |
-| GET | `/api/emails?view=scheduled\|sent&status&campaignId&page&pageSize` | session | | Paginated list from Postgres |
-| GET | `/api/emails/stats` | session | | Counts for the sidebar |
-| GET | `/api/emails/:id` | session | | Email with body and event history |
-| GET | `/api/search/emails?q&view=scheduled\|sent\|all&status&page` | session | | Elasticsearch hits with highlights; 503 if the cluster is down |
-| GET | `/api/slack/status` | session | | `{ configured, connected, teamName, channelName }` |
-| GET | `/api/slack/install` | session | | 302 to Slack |
-| GET | `/api/slack/callback` | state | `code`, `state` | Stores the connection, 302 to `/settings?slack=` |
-| POST | `/api/slack/test` | session | | Posts a test message |
-| DELETE | `/api/slack/connection` | session | | Revokes the token and deletes the row |
-| GET | `/api/admin/queues/summary` | admin | | Job counts per queue |
-| POST | `/api/admin/reconcile` | admin | | Re-queues pending emails that have no live job |
-| GET | `/admin/queues` | admin | | Bull Board UI |
+- `POST /api/leads/parse`: parse an uploaded CSV/TXT or pasted text into valid, de-duplicated emails
+- `POST /api/campaigns`: schedule a campaign (requires an `Idempotency-Key` header)
+- `GET /api/campaigns`: list campaigns with per-status counts
+- `GET /api/emails`: scheduled or sent emails (`view=scheduled|sent`), paginated
+- `GET /api/search/emails`: Elasticsearch search over the user's emails
+- `GET /api/slack/install`: start the Slack OAuth flow
+- `GET /api/slack/status`: Slack connection status
+- `GET /api/admin/queues/summary`: job counts per queue (admin only)
 
-**Error codes:** `VALIDATION_ERROR`, `INVALID_JSON`, `BAD_REQUEST`, `PAYLOAD_TOO_LARGE`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `RATE_LIMITED`, `SERVICE_UNAVAILABLE`, `INTERNAL_ERROR`. Unknown errors are logged with a stack trace and returned as a generic 500.
+The route definitions live in `backend/src/modules/*/*.routes.ts`.
 
 ## 20. Scheduling architecture
 
@@ -430,16 +393,11 @@ sent, failed -> final
 
 The Scheduled tab shows `scheduled`, `processing` and `rate_limited`. The Sent tab shows `sent` and `failed`.
 
-### What happens when 1000 emails are scheduled for 10:00
+### 1000+ emails
 
-This example assumes the defaults: 2 s minimum gap, 200 per hour, and two workers with concurrency 5.
+1000+ emails are accepted as individual delayed jobs. Worker concurrency and Redis-backed scheduling spread the sends according to the configured minimum delay and hourly limits. Emails that exceed a limit are rescheduled rather than dropped.
 
-1. The API inserts 1000 rows and 1000 events in one transaction, then `addBulk`s 1000 delayed jobs in two chunks. Measured locally: 1000 recipients were accepted in about 1 second, 1000 delayed jobs were created, and a double submit returned 200 without adding a job.
-2. At 10:00 the jobs become due, and 10 run at once across both workers.
-3. Each job runs the Lua script once. The script hands out slots 10:00:00, 10:00:02, … 10:06:38 for the first 200 emails. A job whose slot is in the future moves straight back to delayed until its slot, so it never holds a worker slot while waiting.
-4. Job 201 finds 200 sends already inside the rolling hour. Its row becomes `rate_limited` with `next_attempt_at = 10:00:00 + 1 h + 1.025 s jitter margin + sequence ms`, about 11:00:01. Its job is delayed to that time, and one Slack alert is queued.
-5. The same happens for emails 202 to 1000. Nothing is written to the rate-limit sets for a blocked email.
-6. From about 11:00:01 the retried jobs reserve again, in their original order. Each new slot is 2 s after the previous one, and each one is only allowed because a 10:0x send has just left the rolling hour. So the next 200 go out between about 11:00:01 and 11:06:39. Email 401 is then blocked until about 12:00:02, and so on. After five rounds all 1000 are sent. None are dropped, and no rolling hour ever holds more than 200 sends, because the check and the reservation happen in one atomic script.
+Measured locally: 1000 recipients were accepted in about 1 second and 1000 delayed jobs were created. A double submit returned 200 without adding any jobs.
 
 ## 21. Persistence and restart behaviour
 
@@ -495,67 +453,23 @@ Three layers:
 
 ## 24. Minimum send delay strategy
 
-- **Why not `sleep()`?** A sleeping job blocks a concurrency slot, and separate processes would sleep independently, sending at the same moment.
-- **Why not BullMQ's limiter?** It is queue-wide (all senders share one limit), and per-group limits are a BullMQ Pro feature.
-- **What we do:** the Lua script keeps `last_slot` per sender and returns `slot = max(now, last_slot + gap)`. `gap` is the larger of `MIN_SEND_DELAY_MS` and the campaign's "delay between emails".
-  - A job whose slot is in the future stores the reservation in its data and `moveToDelayed(slot)`. It frees the worker immediately and comes back on time.
-  - A reservation is only honoured if the job returns within a short grace period. A late job (for example after an outage) re-reserves instead of bursting.
-  - Slots are spaced exactly by the gap. Actual SMTP start times can shift by the per-job processing latency, measured at under 100 ms locally.
-- **Trade-off:** campaigns that share a sender are serialized at the larger gap, which is conservative for deliverability.
+- Each sender has a `last_slot` in Redis. A new send gets `slot = max(now, last_slot + gap)`, where `gap` is the larger of `MIN_SEND_DELAY_MS` and the campaign's "delay between emails".
+- A job whose slot is in the future is moved back to BullMQ's delayed set until that slot, so it never holds a worker while waiting.
+- Why not `sleep()`? A sleeping job blocks a concurrency slot, and separate processes would sleep independently and send at the same moment.
+- Why not BullMQ's built-in limiter? It is queue-wide, and per-group limits are a BullMQ Pro feature.
 
 ## 25. Hourly rate-limit strategy
 
-The limit is a **rolling (sliding-log) window** of length `RATE_LIMIT_WINDOW_MS`, one hour by default. It is not aligned to clock hours or minutes. The guarantee: a sender never has more than N reserved sends inside any window of that length, whenever the window starts. The code is in `backend/src/modules/delivery/send-slot-limiter.ts`.
+- **Rolling window:** a sender never has more than N reserved sends in any `RATE_LIMIT_WINDOW_MS` window (one hour by default), whenever that window starts. It is not aligned to clock hours.
+- **Redis sorted sets:** one per sender and one per campaign, holding each reserved send (member = email ID, score = slot time). Using the email ID as the member means a re-reservation is never counted twice.
+- **Atomic Lua:** the minimum-gap check, both limit checks and the reservation run as one Lua script. Redis executes it as a single command.
+- **Sender and campaign limits:** `MAX_EMAILS_PER_HOUR_PER_SENDER` applies across all of a sender's campaigns. The compose form's hourly limit applies per campaign, capped at the sender limit.
+- **Rescheduling:** when a limit is reached, the email becomes `rate_limited` and its BullMQ job is delayed until the oldest counted send leaves the window. It is never dropped, and waiting emails resume in campaign order.
+- **Multi-worker safety:** because the check and the reservation are one atomic script, any number of workers and jobs can run at once without exceeding a limit. All of a sender's keys share one hash tag, so this also holds on Redis Cluster.
+- **Jitter margin:** jobs can start a few milliseconds before or up to about a second after their reserved slot. The script therefore counts over the window plus a small margin (1025 ms with the default 2 s gap), so the guarantee holds for actual SMTP start times. The effective window is slightly stricter as a result: about 1.7% at a 60 s window and about 0.03% at one hour.
+- **Why a rolling window:** fixed clock windows are simpler, but they allow up to 2× the limit around a boundary. In testing that showed up as 4 sends in 6 seconds with a limit of 3.
 
-**Data in Redis.** Each sender and each campaign has one sorted set: `rl:{s:<senderId>}:slots` and `rl:{s:<senderId>}:campaign:<campaignId>:slots`.
-
-- Each member is an email ID and its score is that email's reserved slot time in ms.
-- Because the email ID is the member, reserving the same email again replaces its old entry. It is never counted twice.
-- `rl:{s:<senderId>}:last_slot` holds the last reserved slot and drives the minimum gap (section 24).
-
-**The atomic Lua reservation.** Every attempt runs `RESERVE_SEND_SLOT_LUA` once. Redis executes the whole script as one command, so no other client can act between the check and the write. The script:
-
-1. Computes `slot = max(now, last_slot + gap)`. This is the minimum send gap.
-2. **Backlog:** if `slot` is more than one window ahead of now, returns `backlog` with `retryAt = slot − window`, instead of reserving that far out.
-3. For the sender set and the campaign set, independently:
-   - drops entries at or before `now − span`, where `span = window + margin`
-   - removes this email's own previous entry
-   - counts the entries in `(slot − span, slot]`
-4. If a set already holds its limit, finds the entry that must expire to make room (by rank, so a limit lowered in config is handled too). It then returns `retryAt = that entry + span` and `windowStart = that entry`.
-   - If both limits are hit, it reports `sender_limit` and uses the later of the two times.
-   - Nothing is written for a blocked email.
-5. Otherwise it adds the email to both sets (score = `slot`), sets expiries that cover the entry's full window, updates `last_slot`, and returns the slot.
-
-**Two limits, enforced independently:**
-
-- **Sender limit:** `MAX_EMAILS_PER_HOUR_PER_SENDER`, applied across all of the sender's campaigns.
-- **Campaign limit:** the "Hourly limit" from the compose form. It is stored on the campaign and capped at the sender limit. It only counts that campaign's sends, so one campaign cannot block another beyond the shared sender limit.
-
-**Rescheduling instead of dropping.** When the script says a limit is reached, the worker:
-
-- marks the row `rate_limited`
-- writes an event with the reason, `windowStart` and `retryAt`
-- delays the job to `retryAt + sequence` milliseconds with `moveToDelayed` and `DelayedError`
-
-The job stays in BullMQ as a delayed job, and the delay does not count as a failed attempt. The added sequence offset makes the waiting emails wake up in campaign order. Once the oldest counted send has left the window, the first one to wake gets a slot.
-
-**Jitter margin.** The worker passes `marginMs = slotGraceMs + 25` to the script. With the default 2 s gap this is 1025 ms, because `slotGraceMs = min(1000, max(250, gap / 2))`. The script counts over `window + margin` instead of just `window`.
-
-- **Why the margin exists:** a reserved slot is not the exact moment SMTP starts. A job may start up to 25 ms before its slot, or up to `slotGraceMs` after it (plus a few ms of database work).
-- Without the margin, one send starting late and a later send starting early could put N + 1 actual delivery starts inside W.
-- The margin covers that spread, so the guarantee holds for real delivery starts, not just reserved slots.
-
-**Trade-off.** The effective window is slightly stricter than configured: N sends per `W + margin`. That is about 61.0 s instead of 60 s in the demo setup (about 1.7% stricter), and about 1 h 0 m 1 s instead of 1 h (about 0.03%).
-
-- A sorted set costs O(log N) per operation and keeps at most about one window's worth of entries per sender and campaign.
-- A fixed-window counter would be O(1), but it allows up to 2× the limit around a clock boundary. That is the bug this design fixed: 4 sends in 6 seconds with a limit of 3.
-
-**Verified live:** limit 3, window 60 s, gap 2 s, 6 emails around a minute boundary.
-
-- 3 sends started at :54.7, :56.6 and :58.6.
-- Emails 4 to 6 were rate limited and rescheduled to about :55.6 of the next minute, then sent in order.
-- The most delivery starts in any rolling 60 s was 3.
-- Exactly one Slack alert was posted.
+The implementation is in `backend/src/modules/delivery/send-slot-limiter.ts`, and its behaviour is covered by `backend/tests/delivery/send-slot-limiter.test.ts`.
 
 ## 26. Slack notification behaviour
 
@@ -574,24 +488,7 @@ The job stays in BullMQ as a delayed job, and the delay does not count as a fail
 
 ## 27. Elasticsearch strategy
 
-- **Why:** full-text search with relevance, prefix matching and highlighting across recipient, subject, body and sender, without adding load to the transactional database.
-- **What is indexed:** one document per email, containing:
-  - IDs: `id`, `userId`, `campaignId`, `senderId`
-  - `senderEmail`, `senderName`, `recipientEmail`
-  - `subject`, `body`, `status`, `attempts`
-  - `scheduledAt`, `nextAttemptAt`, `sentAt`, `completedAt`, `createdAt`
-  - `previewUrl`, `lastError`
-
-  Email fields use a custom analyzer that splits `jane.doe@acme.com` into `jane`, `doe`, `acme`, `com`, so searching "jane" finds it.
-- **When:** after every state change, the API or worker queues a `search-index` job. Indexing is asynchronous. The job reads the current row from Postgres and writes it with `version = updated_at` in external versioning mode, so a stale job can never overwrite newer data.
-- **Failure:**
-  - Index jobs retry with backoff, and email delivery is unaffected.
-  - The search API returns 503 with a friendly message.
-  - The dashboard lists read from Postgres and keep working.
-  - `npm run search:reindex` rebuilds everything.
-
-  This was exercised by accident during testing: the worker started with a wrong Elasticsearch URL, all emails were still sent, and the reindex script brought the index back in sync.
-- **Queries:** every search is filtered by `userId`. Users only ever see their own emails.
+Elasticsearch asynchronously indexes scheduled and sent emails for full-text search. PostgreSQL remains the source of truth, and the index can be rebuilt with `npm run search:reindex`. If Elasticsearch is down, email delivery and the dashboard lists keep working, and only search returns an error. Every search is filtered to the signed-in user.
 
 ## 28. BullMQ dashboard
 
@@ -680,15 +577,9 @@ npm run build
 
 ## 33. Future improvements
 
-- Containerize the API and worker, and add a CI pipeline running tests against Compose services
-- Rich-text editor, attachments, templates and per-recipient variables
-- Pause, resume and cancel campaigns, with proper `cancelled` status handling in the worker
-- Per-sender limits editable in the UI
-- Outbox pattern for enqueueing, so no reconciliation is needed after a commit-then-crash
-- Elasticsearch index aliases for zero-downtime mapping changes, and archiving of old `email_events`
-- Playwright end-to-end tests for the UI, and component tests
-- Metrics (Prometheus or OpenTelemetry) for queue depth, send latency and rate-limit hits
-- Workspaces and teams with shared senders
+- Containerize the API and worker, with CI
+- Add pause, resume and cancel controls for campaigns
+- Add end-to-end Playwright tests and production metrics
 
 ## Verification status
 
